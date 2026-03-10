@@ -1,10 +1,8 @@
-import serial
 import time
 import threading
 import os
-import subprocess
 from datetime import datetime
-from flask import Flask, jsonify, render_template_string, request, session
+from flask import Flask, jsonify, request, session
 from flask_cors import CORS
 import sqlite3
 import hashlib
@@ -14,14 +12,8 @@ app = Flask(__name__)
 app.secret_key = 'smart-shopping-system-secret-key-2024'
 CORS(app)
 
-# Force using COM6
-SERIAL_PORT = 'COM6'
-BAUD_RATE = 9600
-
-# Global variables
-ser = None
-current_card = None
-serial_connected = False
+# 移除所有序列埠相關變數
+# 保留資料庫和條碼掃描器變數
 database_initialized = False
 
 # Barcode scanner variables
@@ -31,6 +23,34 @@ BARCODE_TIMEOUT = 2  # seconds between barcode scans
 
 # Password attempt limits
 login_attempts = {}
+
+# 預設使用者（不需要刷卡，直接使用密碼登入）
+DEFAULT_USERS = {
+    'admin': {
+        'name': 'Admin',
+        'password': 'admin123',
+        'balance': 1000.0,
+        'reward_points': 50.0,
+        'is_admin': True
+    },
+    'william': {
+        'name': 'William',
+        'password': '12345678',
+        'balance': 500.0,
+        'reward_points': 25.0,
+        'is_admin': True
+    },
+    'user': {
+        'name': 'Demo User',
+        'password': 'demo123',
+        'balance': 200.0,
+        'reward_points': 10.0,
+        'is_admin': False
+    }
+}
+
+# 當前登入的使用者
+current_user = None
 
 # Initialize database
 def init_database():
@@ -45,11 +65,11 @@ def init_database():
     
     # Create customers table with password field and reward points
     c.execute('''CREATE TABLE IF NOT EXISTS customers
-                 (card_uid TEXT PRIMARY KEY,
+                 (username TEXT PRIMARY KEY,
                   name TEXT NOT NULL,
+                  password_hash TEXT NOT NULL,
                   balance REAL DEFAULT 0.0,
                   reward_points REAL DEFAULT 0.0,
-                  password_hash TEXT,
                   is_admin BOOLEAN DEFAULT FALSE,
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     
@@ -59,7 +79,7 @@ def init_database():
                   name TEXT NOT NULL,
                   price REAL NOT NULL,
                   category TEXT,
-                  barcode TEXT UNIQUE,  -- Added barcode field
+                  barcode TEXT UNIQUE,
                   stock INTEGER DEFAULT 100,
                   reward_points_cost REAL DEFAULT 0.0,
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
@@ -67,82 +87,37 @@ def init_database():
     # Create purchase history table
     c.execute('''CREATE TABLE IF NOT EXISTS purchase_history
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  card_uid TEXT NOT NULL,
+                  username TEXT NOT NULL,
                   product_id INTEGER NOT NULL,
                   product_name TEXT NOT NULL,
-                  barcode TEXT,  -- Added barcode field
+                  barcode TEXT,
                   quantity INTEGER NOT NULL,
                   unit_price REAL NOT NULL,
                   total_price REAL NOT NULL,
                   earned_points REAL DEFAULT 0.0,
                   purchase_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (card_uid) REFERENCES customers (card_uid),
-                  FOREIGN KEY (product_id) REFERENCES products (id))''')
+                  FOREIGN KEY (username) REFERENCES customers (username))''')
     
     # Create topup history table
     c.execute('''CREATE TABLE IF NOT EXISTS topup_history
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  card_uid TEXT NOT NULL,
+                  username TEXT NOT NULL,
                   amount REAL NOT NULL,
                   previous_balance REAL NOT NULL,
                   new_balance REAL NOT NULL,
                   topup_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (card_uid) REFERENCES customers (card_uid))''')
+                  FOREIGN KEY (username) REFERENCES customers (username))''')
     
     # Create reward redemption history table
     c.execute('''CREATE TABLE IF NOT EXISTS reward_redemptions
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  card_uid TEXT NOT NULL,
+                  username TEXT NOT NULL,
                   product_id INTEGER NOT NULL,
                   product_name TEXT NOT NULL,
                   points_used REAL NOT NULL,
                   redemption_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (card_uid) REFERENCES customers (card_uid),
+                  FOREIGN KEY (username) REFERENCES customers (username),
                   FOREIGN KEY (product_id) REFERENCES products (id))''')
-    
-    # Check if reward_points column exists, if not add it
-    try:
-        c.execute("SELECT reward_points FROM customers LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE customers ADD COLUMN reward_points REAL DEFAULT 0.0")
-    
-    # Check if reward_points_cost column exists in products, if not add it
-    try:
-        c.execute("SELECT reward_points_cost FROM products LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE products ADD COLUMN reward_points_cost REAL DEFAULT 0.0")
-    
-    # Check if earned_points column exists in purchase_history, if not add it
-    try:
-        c.execute("SELECT earned_points FROM purchase_history LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE purchase_history ADD COLUMN earned_points REAL DEFAULT 0.0")
-    
-    # Check if password_hash column exists, if not add it
-    try:
-        c.execute("SELECT password_hash FROM customers LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE customers ADD COLUMN password_hash TEXT")
-    
-    # Check if is_admin column exists, if not add it
-    try:
-        c.execute("SELECT is_admin FROM customers LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE customers ADD COLUMN is_admin BOOLEAN DEFAULT FALSE")
-    
-    # Check if barcode column exists in products, if not add it
-    try:
-        c.execute("SELECT barcode FROM products LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE products ADD COLUMN barcode TEXT UNIQUE")
-        print("✅ Added barcode column to products table")
-    
-    # Check if barcode column exists in purchase_history, if not add it
-    try:
-        c.execute("SELECT barcode FROM purchase_history LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE purchase_history ADD COLUMN barcode TEXT")
-        print("✅ Added barcode column to purchase_history table")
     
     # Check if sample data already exists
     c.execute("SELECT COUNT(*) FROM customers")
@@ -153,15 +128,11 @@ def init_database():
     
     # Only insert sample data if tables are empty
     if customer_count == 0:
-        # Use secure password hashing
-        admin_password_hash = hash_password('admin123')
-        william_password_hash = hash_password('12345678')
-        
-        # Insert sample customer data with password hashes - BOTH AS ADMINS
-        c.execute("INSERT INTO customers (card_uid, name, balance, reward_points, password_hash, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
-                  ('9073ACED', 'Admin', 1000.00, 50.0, admin_password_hash, True))
-        c.execute("INSERT INTO customers (card_uid, name, balance, reward_points, password_hash, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
-                  ('300757DB', 'William', 500.00, 25.0, william_password_hash, True))
+        # Insert default users
+        for username, user_data in DEFAULT_USERS.items():
+            password_hash = hash_password(user_data['password'])
+            c.execute("INSERT INTO customers (username, name, password_hash, balance, reward_points, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
+                     (username, user_data['name'], password_hash, user_data['balance'], user_data['reward_points'], user_data['is_admin']))
     
     if product_count == 0:
         # Insert sample product data with barcodes and reward points cost
@@ -198,12 +169,12 @@ def verify_password(input_password, stored_hash):
         return False
     return hash_password(input_password) == stored_hash
 
-def check_login_attempts(card_uid):
+def check_login_attempts(username):
     """Check login attempts to prevent brute force attacks"""
-    if card_uid not in login_attempts:
-        login_attempts[card_uid] = {'count': 0, 'last_attempt': time.time()}
+    if username not in login_attempts:
+        login_attempts[username] = {'count': 0, 'last_attempt': time.time()}
     
-    attempts = login_attempts[card_uid]
+    attempts = login_attempts[username]
     
     # Reset counter if more than 5 minutes have passed
     if time.time() - attempts['last_attempt'] > 300:  # 5 minutes
@@ -215,12 +186,12 @@ def check_login_attempts(card_uid):
     
     return True, "OK"
 
-def record_login_attempt(card_uid, success):
+def record_login_attempt(username, success):
     """Record login attempt"""
-    if card_uid not in login_attempts:
-        login_attempts[card_uid] = {'count': 0, 'last_attempt': time.time()}
+    if username not in login_attempts:
+        login_attempts[username] = {'count': 0, 'last_attempt': time.time()}
     
-    attempts = login_attempts[card_uid]
+    attempts = login_attempts[username]
     attempts['last_attempt'] = time.time()
     
     if success:
@@ -228,14 +199,14 @@ def record_login_attempt(card_uid, success):
     else:
         attempts['count'] += 1
 
-def add_value(card_uid, amount):
+def add_value(username, amount):
     """Add value/balance to customer account"""
     conn = sqlite3.connect('shopping_system.db', check_same_thread=False)
     c = conn.cursor()
     
     try:
         # Check if customer exists
-        c.execute("SELECT name, balance FROM customers WHERE card_uid = ?", (card_uid,))
+        c.execute("SELECT name, balance FROM customers WHERE username = ?", (username,))
         customer = c.fetchone()
         
         if not customer:
@@ -246,25 +217,22 @@ def add_value(card_uid, amount):
         new_balance = current_balance + amount
         
         # Update customer balance
-        c.execute("UPDATE customers SET balance = ? WHERE card_uid = ?", (new_balance, card_uid))
+        c.execute("UPDATE customers SET balance = ? WHERE username = ?", (new_balance, username))
         
         # Record topup history
         c.execute('''INSERT INTO topup_history 
-                    (card_uid, amount, previous_balance, new_balance)
+                    (username, amount, previous_balance, new_balance)
                     VALUES (?, ?, ?, ?)''',
-                 (card_uid, amount, current_balance, new_balance))
+                 (username, amount, current_balance, new_balance))
         
         conn.commit()
         conn.close()
         
-        # Update current card balance if it's the same card
-        global current_card
-        if current_card and current_card.get('card_uid') == card_uid:
-            current_card['balance'] = new_balance
-            current_card['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Send updated balance to Arduino
-        send_balance_to_arduino(card_uid)
+        # Update current user balance
+        global current_user
+        if current_user and current_user.get('username') == username:
+            current_user['balance'] = new_balance
+            current_user['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         return True, f"✅ Successfully added ¥{amount:.2f} to {name}. New balance: ¥{new_balance:.2f}"
         
@@ -272,248 +240,88 @@ def add_value(card_uid, amount):
         conn.close()
         return False, f"❌ Error adding value: {str(e)}"
 
-def get_topup_history(card_uid=None):
+def get_topup_history(username=None):
     """Get topup history"""
     conn = sqlite3.connect('shopping_system.db', check_same_thread=False)
     c = conn.cursor()
     
-    if card_uid:
+    if username:
         c.execute('''SELECT th.amount, th.previous_balance, th.new_balance, 
                             th.topup_time, c.name
                      FROM topup_history th
-                     JOIN customers c ON th.card_uid = c.card_uid
-                     WHERE th.card_uid = ?
-                     ORDER BY th.topup_time DESC''', (card_uid,))
+                     JOIN customers c ON th.username = c.username
+                     WHERE th.username = ?
+                     ORDER BY th.topup_time DESC''', (username,))
     else:
         c.execute('''SELECT th.amount, th.previous_balance, th.new_balance, 
-                            th.topup_time, c.name, c.card_uid
+                            th.topup_time, c.name, c.username
                      FROM topup_history th
-                     JOIN customers c ON th.card_uid = c.card_uid
+                     JOIN customers c ON th.username = c.username
                      ORDER BY th.topup_time DESC LIMIT 50''')
     
     history = c.fetchall()
     conn.close()
     return history
 
-def connect_serial():
-    """Connect to COM6 - Enhanced version"""
-    global ser, serial_connected
-    
-    max_retries = 5
-    retry_delay = 3
-    
-    for attempt in range(max_retries):
-        try:
-            # Connect to serial port
-            ser = serial.Serial(
-                port=SERIAL_PORT,
-                baudrate=BAUD_RATE,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=1,
-                write_timeout=1,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False
-            )
-            
-            serial_connected = True
-            
-            # Clear buffers
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            
-            return True
-            
-        except serial.SerialException as e:
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-    
-    return False
-
-def parse_card_data(line):
-    """Parse card data - Modified to require password authentication"""
-    try:
-        line = line.strip()
-        
-        if line.startswith("CARD:"):
-            if '|NAME:' in line and '|BALANCE:' in line:
-                parts = line.split('|')
-                card_uid = parts[0].replace("CARD:", "").strip().upper()
-                
-                name = balance = reward_points = None
-                for part in parts[1:]:
-                    if part.startswith("NAME:"):
-                        name = part.replace("NAME:", "").strip()
-                    elif part.startswith("BALANCE:"):
-                        try:
-                            balance = float(part.replace("BALANCE:", "").strip())
-                        except ValueError:
-                            balance = 0.0
-                    elif part.startswith("POINTS:"):
-                        try:
-                            reward_points = float(part.replace("POINTS:", "").strip())
-                        except ValueError:
-                            reward_points = 0.0
-                
-                if name and balance is not None:
-                    # Set state requiring password authentication
-                    return {
-                        'card_uid': card_uid,
-                        'name': name,
-                        'balance': balance,
-                        'reward_points': reward_points or 0.0,
-                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        'needs_password': True,
-                        'authenticated': False
-                    }
-        
-        elif line.startswith("UNKNOWN_CARD:"):
-            card_uid = line.replace("UNKNOWN_CARD:", "").strip().upper()
-            return {
-                'card_uid': card_uid,
-                'name': 'Unauthorized User',
-                'balance': 0.0,
-                'reward_points': 0.0,
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'type': 'unknown'
-            }
-    
-    except Exception as e:
-        pass
-    
-    return None
-
-def serial_listener():
-    """Serial listener thread"""
-    global current_card, serial_connected
-    
-    buffer = ""
-    
-    while True:
-        try:
-            if ser and ser.is_open:
-                if ser.in_waiting > 0:
-                    data = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
-                    buffer += data
-                    
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        line = line.strip()
-                        
-                        if line:
-                            card_data = parse_card_data(line)
-                            if card_data:
-                                # Check if authentication status already exists
-                                if current_card and current_card.get('card_uid') == card_data.get('card_uid'):
-                                    # Maintain existing authentication status
-                                    card_data['authenticated'] = current_card.get('authenticated', False)
-                                    card_data['needs_password'] = current_card.get('needs_password', True)
-                                
-                                current_card = card_data
-            
-            time.sleep(0.1)
-            
-        except Exception as e:
-            serial_connected = False
-            time.sleep(2)
-            if connect_serial():
-                buffer = ""
-
 # Database operations
-def get_customer_info(card_uid):
+def get_customer_info(username):
     """Get customer information including password hash, reward points, and admin status"""
     conn = sqlite3.connect('shopping_system.db', check_same_thread=False)
     c = conn.cursor()
     try:
-        c.execute("SELECT name, balance, reward_points, password_hash, is_admin FROM customers WHERE card_uid = ?", (card_uid,))
+        c.execute("SELECT name, balance, reward_points, password_hash, is_admin FROM customers WHERE username = ?", (username,))
         result = c.fetchone()
         return result
-    except sqlite3.OperationalError as e:
-        # If is_admin column doesn't exist yet, return default values
-        try:
-            c.execute("SELECT name, balance, reward_points, password_hash FROM customers WHERE card_uid = ?", (card_uid,))
-            result = c.fetchone()
-            if result:
-                # Add default admin status (False) for existing records
-                return result + (False,)  # Add is_admin as False
-            return None
-        except:
-            return None
+    except Exception as e:
+        return None
     finally:
         conn.close()
 
-def authenticate_user(card_uid, password):
-    """Authenticate user with password"""
-    customer_info = get_customer_info(card_uid)
+def authenticate_user(username, password):
+    """Authenticate user with username and password"""
+    customer_info = get_customer_info(username)
     if not customer_info:
-        return False, "Card not found"
+        return False, "Username not found"
     
-    # Handle both old format (4 items) and new format (5 items with is_admin)
-    if len(customer_info) == 4:
-        name, balance, reward_points, password_hash = customer_info
-        is_admin = False  # Default to non-admin for old format
-    else:
-        name, balance, reward_points, password_hash, is_admin = customer_info
+    name, balance, reward_points, password_hash, is_admin = customer_info
     
     # Check login attempts
-    can_attempt, message = check_login_attempts(card_uid)
+    can_attempt, message = check_login_attempts(username)
     if not can_attempt:
         return False, message
     
     # Verify password
     if verify_password(password, password_hash):
-        record_login_attempt(card_uid, True)
+        record_login_attempt(username, True)
         session['authenticated'] = True
-        session['card_uid'] = card_uid
+        session['username'] = username
         session['user_name'] = name
-        session['is_admin'] = bool(is_admin)  # Ensure boolean value
+        session['is_admin'] = bool(is_admin)
+        
+        # Update current user
+        global current_user
+        current_user = {
+            'username': username,
+            'name': name,
+            'balance': balance,
+            'reward_points': reward_points,
+            'is_admin': bool(is_admin),
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'authenticated': True
+        }
+        
         return True, "Authentication successful"
     else:
-        record_login_attempt(card_uid, False)
-        remaining_attempts = 5 - login_attempts[card_uid]['count']
+        record_login_attempt(username, False)
+        remaining_attempts = 5 - login_attempts[username]['count']
         if remaining_attempts <= 0:
             return False, "Account locked. Too many failed attempts."
         else:
             return False, f"Invalid password. {remaining_attempts} attempts remaining."
 
-def migrate_database():
-    """Ensure database has latest schema and William is admin"""
-    conn = sqlite3.connect('shopping_system.db', check_same_thread=False)
-    c = conn.cursor()
-    
-    try:
-        # Check if is_admin column exists
-        c.execute("SELECT is_admin FROM customers LIMIT 1")
-    except sqlite3.OperationalError:
-        # Add is_admin column if it doesn't exist
-        c.execute("ALTER TABLE customers ADD COLUMN is_admin BOOLEAN DEFAULT FALSE")
-        print("✅ Added is_admin column to customers table")
-    
-    # Ensure William is set as admin
-    c.execute("UPDATE customers SET is_admin = TRUE WHERE card_uid = '300757DB' AND name = 'William'")
-    
-    # Check if update was successful
-    c.execute("SELECT is_admin FROM customers WHERE card_uid = '300757DB'")
-    result = c.fetchone()
-    if result and result[0]:
-        print("✅ William is now set as admin")
-    else:
-        print("⚠️  Could not set William as admin - card might not exist")
-    
-    conn.commit()
-    conn.close()
-
-# Add this after database initialization
+# Initialize database
 if not database_initialized:
     init_database()
-
-# Run migration after initialization
-migrate_database()
 
 def is_authenticated():
     """Check if user is authenticated"""
@@ -527,7 +335,7 @@ def get_current_user():
     """Get current authenticated user information"""
     if is_authenticated():
         return {
-            'card_uid': session.get('card_uid'),
+            'username': session.get('username'),
             'name': session.get('user_name'),
             'is_admin': session.get('is_admin', False)
         }
@@ -535,7 +343,9 @@ def get_current_user():
 
 def logout_user():
     """User logout"""
+    global current_user
     session.clear()
+    current_user = None
 
 def get_products():
     """Get all products"""
@@ -632,9 +442,9 @@ def delete_product(product_id):
         conn.close()
         return False, f"Error deleting product: {str(e)}"
 
-def record_purchase(card_uid, product_id, quantity, use_points=False):
-    """Record purchase with reward points - FIXED VERSION"""
-    print(f"🔔 record_purchase called: card={card_uid}, product={product_id}, qty={quantity}, use_points={use_points}")
+def record_purchase(username, product_id, quantity, use_points=False):
+    """Record purchase with reward points"""
+    print(f"🔔 record_purchase called: user={username}, product={product_id}, qty={quantity}, use_points={use_points}")
     
     conn = sqlite3.connect('shopping_system.db', check_same_thread=False)
     c = conn.cursor()
@@ -661,7 +471,7 @@ def record_purchase(card_uid, product_id, quantity, use_points=False):
             total_points_cost = points_cost * quantity
             
             # Check customer points balance
-            c.execute("SELECT reward_points FROM customers WHERE card_uid = ?", (card_uid,))
+            c.execute("SELECT reward_points FROM customers WHERE username = ?", (username,))
             result = c.fetchone()
             if not result:
                 conn.close()
@@ -680,13 +490,13 @@ def record_purchase(card_uid, product_id, quantity, use_points=False):
             
             # Record reward redemption
             c.execute('''INSERT INTO reward_redemptions 
-                        (card_uid, product_id, product_name, points_used)
+                        (username, product_id, product_name, points_used)
                         VALUES (?, ?, ?, ?)''',
-                     (card_uid, product_id, product_name, total_points_cost))
+                     (username, product_id, product_name, total_points_cost))
             
             # Update customer points
-            c.execute("UPDATE customers SET reward_points = reward_points - ? WHERE card_uid = ?",
-                     (total_points_cost, card_uid))
+            c.execute("UPDATE customers SET reward_points = reward_points - ? WHERE username = ?",
+                     (total_points_cost, username))
             
             # Update product stock
             c.execute("UPDATE products SET stock = stock - ? WHERE id = ?",
@@ -707,7 +517,7 @@ def record_purchase(card_uid, product_id, quantity, use_points=False):
             total_price = unit_price * quantity
             
             # Check customer balance
-            c.execute("SELECT balance FROM customers WHERE card_uid = ?", (card_uid,))
+            c.execute("SELECT balance FROM customers WHERE username = ?", (username,))
             result = c.fetchone()
             if not result:
                 conn.close()
@@ -724,21 +534,21 @@ def record_purchase(card_uid, product_id, quantity, use_points=False):
             
             # Record purchase history with barcode
             c.execute('''INSERT INTO purchase_history 
-                        (card_uid, product_id, product_name, barcode, quantity, unit_price, total_price, earned_points)
+                        (username, product_id, product_name, barcode, quantity, unit_price, total_price, earned_points)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                     (card_uid, product_id, product_name, barcode, quantity, unit_price, total_price, earned_points))
+                     (username, product_id, product_name, barcode, quantity, unit_price, total_price, earned_points))
             
             print(f"📝 Purchase history recorded: {product_name} x{quantity}, ¥{total_price}")
             
             # Update customer balance
-            c.execute("UPDATE customers SET balance = balance - ? WHERE card_uid = ?",
-                     (total_price, card_uid))
+            c.execute("UPDATE customers SET balance = balance - ? WHERE username = ?",
+                     (total_price, username))
             
             print(f"💰 Updated customer balance: -¥{total_price}")
             
             # Update customer reward points
-            c.execute("UPDATE customers SET reward_points = reward_points + ? WHERE card_uid = ?",
-                     (earned_points, card_uid))
+            c.execute("UPDATE customers SET reward_points = reward_points + ? WHERE username = ?",
+                     (earned_points, username))
             
             print(f"⭐ Updated customer points: +{earned_points}")
             
@@ -766,80 +576,60 @@ def record_purchase(card_uid, product_id, quantity, use_points=False):
         conn.close()
         return False, f"Error: {str(e)}"
 
-def get_purchase_history(card_uid=None):
-    """Get purchase history - if card_uid provided, only get that user's history"""
+def get_purchase_history(username=None):
+    """Get purchase history - if username provided, only get that user's history"""
     conn = sqlite3.connect('shopping_system.db', check_same_thread=False)
     c = conn.cursor()
     
-    if card_uid:
+    if username:
         c.execute('''SELECT ph.product_name, ph.quantity, ph.unit_price, ph.total_price, 
                             ph.earned_points, ph.purchase_time, c.name, ph.barcode
                      FROM purchase_history ph
-                     JOIN customers c ON ph.card_uid = c.card_uid
-                     WHERE ph.card_uid = ?
-                     ORDER BY ph.purchase_time DESC''', (card_uid,))
+                     JOIN customers c ON ph.username = c.username
+                     WHERE ph.username = ?
+                     ORDER BY ph.purchase_time DESC''', (username,))
     else:
         c.execute('''SELECT ph.product_name, ph.quantity, ph.unit_price, ph.total_price, 
-                            ph.earned_points, ph.purchase_time, c.name, c.card_uid, ph.barcode
+                            ph.earned_points, ph.purchase_time, c.name, c.username, ph.barcode
                      FROM purchase_history ph
-                     JOIN customers c ON ph.card_uid = c.card_uid
+                     JOIN customers c ON ph.username = c.username
                      ORDER BY ph.purchase_time DESC LIMIT 50''')
     
     history = c.fetchall()
     conn.close()
     return history
 
-def get_reward_redemptions(card_uid=None):
+def get_reward_redemptions(username=None):
     """Get reward redemption history"""
     conn = sqlite3.connect('shopping_system.db', check_same_thread=False)
     c = conn.cursor()
     
-    if card_uid:
+    if username:
         c.execute('''SELECT rr.product_name, rr.points_used, rr.redemption_time, c.name
                      FROM reward_redemptions rr
-                     JOIN customers c ON rr.card_uid = c.card_uid
-                     WHERE rr.card_uid = ?
-                     ORDER BY rr.redemption_time DESC''', (card_uid,))
+                     JOIN customers c ON rr.username = c.username
+                     WHERE rr.username = ?
+                     ORDER BY rr.redemption_time DESC''', (username,))
     else:
-        c.execute('''SELECT rr.product_name, rr.points_used, rr.redemption_time, c.name, c.card_uid
+        c.execute('''SELECT rr.product_name, rr.points_used, rr.redemption_time, c.name, c.username
                      FROM reward_redemptions rr
-                     JOIN customers c ON rr.card_uid = c.card_uid
+                     JOIN customers c ON rr.username = c.username
                      ORDER BY rr.redemption_time DESC LIMIT 50''')
     
     history = c.fetchall()
     conn.close()
     return history
 
-def send_balance_to_arduino(card_uid):
-    """Send balance and points information to Arduino"""
-    global ser
-    
-    if not ser or not ser.is_open:
-        return False
-    
-    customer_info = get_customer_info(card_uid)
-    if customer_info:
-        name, balance, reward_points, _, _ = customer_info
-        command = f"UPDATE_BALANCE:{card_uid}:{name}:{balance:.2f}:{reward_points:.3f}\n"
-        try:
-            ser.write(command.encode('utf-8'))
-            ser.flush()
-            return True
-        except Exception as e:
-            return False
-    else:
-        return False
-
-def refresh_current_card_balance():
-    """Refresh the current card balance and points from database"""
-    global current_card
-    if current_card and current_card.get('card_uid'):
-        customer_info = get_customer_info(current_card['card_uid'])
+def refresh_current_user_balance():
+    """Refresh the current user balance and points from database"""
+    global current_user
+    if current_user and current_user.get('username'):
+        customer_info = get_customer_info(current_user['username'])
         if customer_info:
-            name, balance, reward_points, _, _ = customer_info
-            current_card['balance'] = balance
-            current_card['reward_points'] = reward_points
-            current_card['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            name, balance, reward_points, _, is_admin = customer_info
+            current_user['balance'] = balance
+            current_user['reward_points'] = reward_points
+            current_user['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
     return False
 
@@ -896,546 +686,156 @@ def get_scanned_products():
     
     return products
 
-# Initialize database - Only run once
-if not database_initialized:
-    init_database()
-
 # ============================================================================
 # FLASK ROUTES - ALL PAGES IN ONE FILE
 # ============================================================================
 
 @app.route('/')
 def index():
-    """Main dashboard page"""
+    """Main login page"""
     return '''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Smart Shopping System</title>
+        <title>Smart Shopping System - Login</title>
         <meta charset="UTF-8">
         <style>
-            body { font-family: Arial; margin: 0; padding: 0; background: #f5f5f5; }
-            .header { background: #2c3e50; color: white; padding: 1rem; }
-            .nav { display: flex; gap: 1rem; }
-            .nav a { color: white; text-decoration: none; padding: 0.5rem 1rem; border-radius: 4px; }
-            .nav a:hover { background: #34495e; }
-            .nav a.active { background: #3498db; }
-            .container { max-width: 1200px; margin: 0 auto; padding: 1rem; }
-            .status { padding: 1rem; margin: 1rem 0; border-radius: 5px; }
-            .connected { background: #d4edda; color: #155724; }
-            .disconnected { background: #f8d7da; color: #721c24; }
-            .card-actions { display: flex; gap: 0.5rem; margin-top: 1rem; justify-content: center; flex-wrap: wrap; }
-            .card-actions button { padding: 0.5rem 1rem; border: none; border-radius: 4px; cursor: pointer; color: white; }
-            .check-balance { background: #9b59b6; }
-            .refresh-balance { background: #f39c12; }
-            .logout-btn { background: #e74c3c; }
-            .add-value-btn { background: #27ae60; }
-            .admin-btn { background: #e67e22; }
-            .rewards-btn { background: #8e44ad; }
-            
-            .password-modal, .add-value-modal, .confirm-password-modal {
-                display: none;
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: rgba(0,0,0,0.5);
-                z-index: 1000;
+            body { 
+                font-family: Arial; 
+                margin: 0; 
+                padding: 0; 
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
                 justify-content: center;
                 align-items: center;
             }
-            .password-content, .add-value-content, .confirm-password-content {
+            .login-container {
                 background: white;
                 padding: 2rem;
-                border-radius: 8px;
+                border-radius: 10px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
                 width: 350px;
+                max-width: 90%;
+            }
+            h1 {
                 text-align: center;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                color: #333;
+                margin-bottom: 1.5rem;
             }
-            .password-input, .amount-input, .confirm-password-input {
-                width: 100%;
-                padding: 0.75rem;
-                margin: 1rem 0;
-                border: 2px solid #ddd;
-                border-radius: 4px;
-                font-size: 1rem;
-                box-sizing: border-box;
+            .form-group {
+                margin-bottom: 1rem;
             }
-            .password-input:focus, .amount-input:focus, .confirm-password-input:focus {
-                border-color: #3498db;
-                outline: none;
-            }
-            .login-btn, .confirm-btn, .confirm-password-btn {
-                background: #27ae60;
-                color: white;
-                border: none;
-                padding: 0.75rem 1.5rem;
-                border-radius: 4px;
-                cursor: pointer;
-                margin-right: 0.5rem;
-                font-size: 1rem;
-            }
-            .login-btn:hover, .confirm-btn:hover, .confirm-password-btn:hover {
-                background: #219a52;
-            }
-            .login-btn:disabled, .confirm-btn:disabled, .confirm-password-btn:disabled {
-                background: #95a5a6;
-                cursor: not-allowed;
-            }
-            .cancel-btn {
-                background: #95a5a6;
-                color: white;
-                border: none;
-                padding: 0.75rem 1.5rem;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 1rem;
-            }
-            .cancel-btn:hover {
-                background: #7f8c8d;
-            }
-            .password-feedback, .add-value-feedback, .confirm-password-feedback {
-                margin-top: 1rem;
-                padding: 0.75rem;
-                border-radius: 4px;
+            label {
+                display: block;
+                margin-bottom: 0.5rem;
+                color: #555;
                 font-weight: bold;
             }
-            .success-feedback {
+            input {
+                width: 100%;
+                padding: 0.75rem;
+                border: 2px solid #ddd;
+                border-radius: 5px;
+                font-size: 1rem;
+                box-sizing: border-box;
+                transition: border-color 0.3s;
+            }
+            input:focus {
+                outline: none;
+                border-color: #667eea;
+            }
+            .login-btn {
+                width: 100%;
+                padding: 0.75rem;
+                background: #667eea;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                font-size: 1rem;
+                cursor: pointer;
+                transition: background 0.3s;
+            }
+            .login-btn:hover {
+                background: #5a67d8;
+            }
+            .login-btn:disabled {
+                background: #ccc;
+                cursor: not-allowed;
+            }
+            .feedback {
+                margin-top: 1rem;
+                padding: 0.75rem;
+                border-radius: 5px;
+                text-align: center;
+                font-weight: bold;
+                display: none;
+            }
+            .success {
                 background: #d4edda;
                 color: #155724;
                 border: 1px solid #c3e6cb;
             }
-            .error-feedback {
+            .error {
                 background: #f8d7da;
                 color: #721c24;
                 border: 1px solid #f5c6cb;
             }
-            .amount-buttons {
-                display: grid;
-                grid-template-columns: repeat(3, 1fr);
-                gap: 0.5rem;
-                margin: 1rem 0;
+            .demo-accounts {
+                margin-top: 2rem;
+                padding-top: 1rem;
+                border-top: 1px solid #eee;
+                font-size: 0.9rem;
+                color: #666;
             }
-            .amount-btn {
-                padding: 0.75rem;
-                border: 2px solid #3498db;
-                background: white;
-                color: #3498db;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 1rem;
+            .demo-accounts h3 {
+                margin: 0 0 0.5rem 0;
+                color: #333;
             }
-            .amount-btn:hover {
-                background: #3498db;
-                color: white;
-            }
-            .amount-btn.active {
-                background: #3498db;
-                color: white;
-            }
-            .points-display {
-                background: linear-gradient(135deg, #8e44ad, #9b59b6);
-                color: white;
-                padding: 0.5rem 1rem;
-                border-radius: 20px;
-                font-weight: bold;
-                margin: 0.5rem 0;
-                display: inline-block;
-            }
-            .barcode-info {
-                background: #3498db;
-                color: white;
-                padding: 0.5rem 1rem;
-                border-radius: 4px;
-                margin: 0.5rem 0;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 0.5rem;
-            }
-            .clear-barcode-btn {
-                background: #e74c3c;
-                color: white;
-                border: none;
-                padding: 0.25rem 0.5rem;
-                border-radius: 3px;
-                cursor: pointer;
-                margin-left: 0.5rem;
+            .demo-accounts p {
+                margin: 0.25rem 0;
             }
         </style>
     </head>
     <body>
-        <div class="header">
-            <div class="container">
-                <h1>🛒 Smart Shopping System</h1>
-                <div class="nav">
-                    <a href="/" class="active">Home</a>
-                    <a href="/shopping">Shopping</a>
-                    <a href="/rewards">Rewards Shop</a>
-                    <a href="/history">My Purchase History</a>
-                    <a href="/topup">My Top-up History</a>
-                    <a href="/reward_history">My Reward History</a>
-                    <a href="/admin">Admin Panel</a>
-                </div>
+        <div class="login-container">
+            <h1>🛒 Smart Shopping System</h1>
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" placeholder="Enter username" autocomplete="username">
             </div>
-        </div>
-        
-        <div class="container">
-            <div class="status" id="status">Checking COM6 connection...</div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" placeholder="Enter password" autocomplete="current-password">
+            </div>
+            <button class="login-btn" id="loginButton" onclick="login()">Login</button>
+            <div id="feedback" class="feedback"></div>
             
-            <div>
-                <h2>🎯 Card Information</h2>
-                <div id="cardDisplay" style="background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                    <h3>Waiting for card swipe...</h3>
-                    <p>Port: COM6 | Baud Rate: 9600</p>
-                </div>
-            </div>
-            
-            <div id="barcodeDisplay" style="display: none; margin-top: 2rem;">
-                <h2>📦 Scanned Products</h2>
-                <div id="scannedProducts" style="background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                    <p>No products scanned yet. Use barcode scanner to add products.</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- Password Input Modal -->
-        <div class="password-modal" id="passwordModal">
-            <div class="password-content">
-                <h3>Enter Password</h3>
-                <p id="passwordPrompt">Please enter your password</p>
-                <input type="password" id="passwordInput" class="password-input" placeholder="Enter password" autocomplete="current-password">
-                <div id="passwordFeedback" class="password-feedback" style="display: none;"></div>
-                <div style="margin-top: 1.5rem;">
-                    <button class="login-btn" id="loginButton" onclick="submitPassword()">Login</button>
-                    <button class="cancel-btn" onclick="hidePasswordModal()">Cancel</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Add Value Modal -->
-        <div class="add-value-modal" id="addValueModal">
-            <div class="add-value-content">
-                <h3>Add Value to Account</h3>
-                <p id="addValuePrompt">Select amount to add</p>
-                
-                <div class="amount-buttons">
-                    <button class="amount-btn" onclick="selectAmount(10)">¥10</button>
-                    <button class="amount-btn" onclick="selectAmount(50)">¥50</button>
-                    <button class="amount-btn" onclick="selectAmount(100)">¥100</button>
-                    <button class="amount-btn" onclick="selectAmount(200)">¥200</button>
-                    <button class="amount-btn" onclick="selectAmount(500)">¥500</button>
-                    <button class="amount-btn" onclick="selectAmount(1000)">¥1000</button>
-                </div>
-                
-                <input type="number" id="customAmount" class="amount-input" placeholder="Or enter custom amount" min="1" step="1">
-                
-                <div id="addValueFeedback" class="add-value-feedback" style="display: none;"></div>
-                <div style="margin-top: 1.5rem;">
-                    <button class="confirm-btn" id="confirmButton" onclick="confirmAddValue()">Add Value</button>
-                    <button class="cancel-btn" onclick="hideAddValueModal()">Cancel</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Confirm Password Modal -->
-        <div class="confirm-password-modal" id="confirmPasswordModal">
-            <div class="confirm-password-content">
-                <h3>Confirm Add Value</h3>
-                <p id="confirmPasswordPrompt">Please enter your password to confirm adding <span id="confirmAmount" style="font-weight: bold; color: #e74c3c;"></span></p>
-                <input type="password" id="confirmPasswordInput" class="confirm-password-input" placeholder="Enter password" autocomplete="current-password">
-                <div id="confirmPasswordFeedback" class="confirm-password-feedback" style="display: none;"></div>
-                <div style="margin-top: 1.5rem;">
-                    <button class="confirm-password-btn" id="confirmPasswordButton" onclick="submitConfirmPassword()">Confirm Add Value</button>
-                    <button class="cancel-btn" onclick="hideConfirmPasswordModal()">Cancel</button>
-                </div>
+            <div class="demo-accounts">
+                <h3>Demo Accounts:</h3>
+                <p><strong>admin</strong> / admin123 (Admin)</p>
+                <p><strong>william</strong> / 12345678 (Admin)</p>
+                <p><strong>user</strong> / demo123 (Regular User)</p>
             </div>
         </div>
 
         <script>
-            let currentCardData = null;
-            let selectedAmount = 0;
-            let scannedProducts = [];
-            
-            function updateDisplay() {
-                fetch('/api/status')
-                    .then(r => {
-                        if (!r.ok) throw new Error('Network response was not ok');
-                        return r.json();
-                    })
-                    .then(data => {
-                        updateStatus(data);
-                        updateCard(data);
-                        updateScannedProducts();
-                    })
-                    .catch(error => {
-                        console.error('Status update error:', error);
-                    });
-            }
-            
-            function updateStatus(data) {
-                const status = document.getElementById('status');
-                if (data.serial_connected) {
-                    status.textContent = '✅ COM6 Connected - System Ready';
-                    status.className = 'status connected';
-                } else {
-                    status.textContent = '❌ COM6 Connection Failed';
-                    status.className = 'status disconnected';
-                }
-            }
-            
-            function updateCard(data) {
-                const display = document.getElementById('cardDisplay');
-                if (data.current_card) {
-                    const card = data.current_card;
-                    currentCardData = card;
-                    
-                    if (card.needs_password && !card.authenticated) {
-                        // Show password required interface
-                        display.innerHTML = `
-                            <div style="text-align: center;">
-                                <h2 style="color: #f39c12; margin-bottom: 1rem;">🔒 Authentication Required</h2>
-                                <h3>${card.name}</h3>
-                                <p><strong>Card ID:</strong> ${card.card_uid}</p>
-                                <p style="font-size: 1.2rem; margin: 1rem 0;">Please enter password to continue</p>
-                                <button onclick="showPasswordModal()" 
-                                        style="padding: 0.75rem 1.5rem; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1.1rem;">
-                                    Enter Password
-                                </button>
-                            </div>
-                        `;
-                    } else if (card.authenticated) {
-                        // Check if user is admin by making an API call
-                        fetch('/api/auth_status')
-                            .then(response => response.json())
-                            .then(authData => {
-                                const isAdmin = authData.current_user && authData.current_user.is_admin;
-                                
-                                const adminButton = isAdmin ? 
-                                    `<button class="admin-btn" onclick="goToAdmin()">Admin Panel</button>` : '';
-                                
-                                display.innerHTML = `
-                                    <div style="text-align: center;">
-                                        <h2 style="color: #27ae60; margin-bottom: 1rem;">✅ ${card.name}</h2>
-                                        <p><strong>Card ID:</strong> ${card.card_uid}</p>
-                                        <p style="font-size: 2rem; font-weight: bold; color: #e74c3c; margin: 1rem 0;">¥${card.balance.toFixed(2)}</p>
-                                        <div class="points-display">
-                                            ⭐ ${card.reward_points ? card.reward_points.toFixed(3) : '0.000'} Reward Points
-                                        </div>
-                                        <small style="color: #666;">${card.timestamp}</small>
-                                        <div class="card-actions">
-                                            <button class="check-balance" onclick="checkBalance()">Check Balance</button>
-                                            <button class="refresh-balance" onclick="refreshBalance()">Refresh</button>
-                                            <button class="add-value-btn" onclick="showAddValueModal()">Add Value</button>
-                                            <button class="rewards-btn" onclick="goToRewards()">Rewards Shop</button>
-                                            ${adminButton}
-                                            <button class="logout-btn" onclick="logout()">Logout</button>
-                                        </div>
-                                    </div>
-                                `;
-                            })
-                            .catch(error => {
-                                console.error('Error checking admin status:', error);
-                                // Fallback: show without admin button
-                                display.innerHTML = `
-                                    <div style="text-align: center;">
-                                        <h2 style="color: #27ae60; margin-bottom: 1rem;">✅ ${card.name}</h2>
-                                        <p><strong>Card ID:</strong> ${card.card_uid}</p>
-                                        <p style="font-size: 2rem; font-weight: bold; color: #e74c3c; margin: 1rem 0;">¥${card.balance.toFixed(2)}</p>
-                                        <div class="points-display">
-                                            ⭐ ${card.reward_points ? card.reward_points.toFixed(3) : '0.000'} Reward Points
-                                        </div>
-                                        <small style="color: #666;">${card.timestamp}</small>
-                                        <div class="card-actions">
-                                            <button class="check-balance" onclick="checkBalance()">Check Balance</button>
-                                            <button class="refresh-balance" onclick="refreshBalance()">Refresh</button>
-                                            <button class="add-value-btn" onclick="showAddValueModal()">Add Value</button>
-                                            <button class="rewards-btn" onclick="goToRewards()">Rewards Shop</button>
-                                            <button class="logout-btn" onclick="logout()">Logout</button>
-                                        </div>
-                                    </div>
-                                `;
-                            });
-                    }
-                } else {
-                    display.innerHTML = `
-                        <div style="text-align: center;">
-                            <h3>Waiting for card swipe...</h3>
-                            <p>Please place RFID card near the reader</p>
-                            <p style="color: #666;">Port: COM6 | Baud Rate: 9600</p>
-                        </div>
-                    `;
-                }
-            }
-            
-            function updateScannedProducts() {
-                fetch('/api/scanned_products')
-                    .then(response => response.json())
-                    .then(data => {
-                        const barcodeDisplay = document.getElementById('barcodeDisplay');
-                        const scannedProductsDiv = document.getElementById('scannedProducts');
-                        
-                        if (data.products && data.products.length > 0) {
-                            scannedProducts = data.products;
-                            barcodeDisplay.style.display = 'block';
-                            
-                            let html = '<div style="text-align: center;">';
-                            html += '<div class="barcode-info">';
-                            html += '<span>📦 ' + data.products.length + ' product(s) scanned</span>';
-                            html += '<button class="clear-barcode-btn" onclick="clearScannedBarcodes()">Clear All</button>';
-                            html += '</div>';
-                            
-                            html += '<div style="margin-top: 1rem;">';
-                            data.products.forEach((product, index) => {
-                                html += `
-                                    <div style="background: #f8f9fa; padding: 0.75rem; margin: 0.5rem 0; border-radius: 4px; border-left: 4px solid #3498db;">
-                                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                                            <div style="text-align: left;">
-                                                <strong>${product.name}</strong>
-                                                <div style="font-size: 0.9rem; color: #666;">
-                                                    Price: ¥${product.price.toFixed(2)} | Quantity: ${product.quantity}
-                                                </div>
-                                                <div style="font-size: 0.8rem; color: #999;">
-                                                    Barcode: ${product.barcode}
-                                                </div>
-                                            </div>
-                                            <div style="text-align: right;">
-                                                <strong>¥${(product.price * product.quantity).toFixed(2)}</strong>
-                                                <div>
-                                                    <button onclick="removeScannedProduct('${product.barcode}')" style="background: #e74c3c; color: white; border: none; padding: 0.25rem 0.5rem; border-radius: 3px; cursor: pointer; font-size: 0.8rem; margin-top: 0.25rem;">
-                                                        Remove
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                `;
-                            });
-                            
-                            // Calculate total
-                            const total = data.products.reduce((sum, product) => sum + (product.price * product.quantity), 0);
-                            const pointsEarned = total * 0.001;
-                            
-                            html += `
-                                <div style="margin-top: 1rem; padding-top: 1rem; border-top: 2px solid #ddd;">
-                                    <div style="display: flex; justify-content: space-between; font-weight: bold;">
-                                        <span>Total:</span>
-                                        <span>¥${total.toFixed(2)}</span>
-                                    </div>
-                                    <div style="color: #8e44ad; font-size: 0.9rem; margin-top: 0.25rem;">
-                                        Will earn: ${pointsEarned.toFixed(3)} points
-                                    </div>
-                                </div>
-                            `;
-                            
-                            html += '<button onclick="goToShoppingWithScanned()" style="background: #27ae60; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; cursor: pointer; margin-top: 1rem; font-size: 1rem;">Proceed to Checkout</button>';
-                            html += '</div></div>';
-                            
-                            scannedProductsDiv.innerHTML = html;
-                        } else {
-                            barcodeDisplay.style.display = 'none';
-                            scannedProducts = [];
-                        }
-                    });
-            }
-            
-            function showPasswordModal() {
-                const modal = document.getElementById('passwordModal');
-                const prompt = document.getElementById('passwordPrompt');
-                if (currentCardData) {
-                    prompt.textContent = `Please enter password for ${currentCardData.name}`;
-                }
-                document.getElementById('passwordInput').value = '';
-                document.getElementById('passwordFeedback').style.display = 'none';
-                modal.style.display = 'flex';
-                document.getElementById('passwordInput').focus();
-            }
-            
-            function hidePasswordModal() {
-                document.getElementById('passwordModal').style.display = 'none';
-                document.getElementById('passwordFeedback').style.display = 'none';
-            }
-            
-            function showAddValueModal() {
-                const modal = document.getElementById('addValueModal');
-                const prompt = document.getElementById('addValuePrompt');
-                if (currentCardData) {
-                    prompt.textContent = `Add value to ${currentCardData.name}'s account (Current: ¥${currentCardData.balance.toFixed(2)})`;
-                }
-                selectedAmount = 0;
-                document.getElementById('customAmount').value = '';
-                document.getElementById('addValueFeedback').style.display = 'none';
-                
-                // Reset amount buttons
-                document.querySelectorAll('.amount-btn').forEach(btn => {
-                    btn.classList.remove('active');
-                });
-                
-                modal.style.display = 'flex';
-            }
-            
-            function hideAddValueModal() {
-                document.getElementById('addValueModal').style.display = 'none';
-                document.getElementById('addValueFeedback').style.display = 'none';
-            }
-            
-            function showConfirmPasswordModal(amount) {
-                const modal = document.getElementById('confirmPasswordModal');
-                const amountDisplay = document.getElementById('confirmAmount');
-                amountDisplay.textContent = '¥' + amount.toFixed(2);
-                document.getElementById('confirmPasswordInput').value = '';
-                document.getElementById('confirmPasswordFeedback').style.display = 'none';
-                modal.style.display = 'flex';
-                document.getElementById('confirmPasswordInput').focus();
-            }
-            
-            function hideConfirmPasswordModal() {
-                document.getElementById('confirmPasswordModal').style.display = 'none';
-                document.getElementById('confirmPasswordFeedback').style.display = 'none';
-            }
-            
-            function selectAmount(amount) {
-                selectedAmount = amount;
-                document.getElementById('customAmount').value = '';
-                
-                // Update button states
-                document.querySelectorAll('.amount-btn').forEach(btn => {
-                    btn.classList.remove('active');
-                });
-                event.target.classList.add('active');
-            }
-            
-            function showPasswordFeedback(message, isSuccess) {
-                const feedback = document.getElementById('passwordFeedback');
+            function showFeedback(message, isSuccess) {
+                const feedback = document.getElementById('feedback');
                 feedback.textContent = message;
-                feedback.className = isSuccess ? 'password-feedback success-feedback' : 'password-feedback error-feedback';
+                feedback.className = isSuccess ? 'feedback success' : 'feedback error';
                 feedback.style.display = 'block';
             }
             
-            function showAddValueFeedback(message, isSuccess) {
-                const feedback = document.getElementById('addValueFeedback');
-                feedback.textContent = message;
-                feedback.className = isSuccess ? 'add-value-feedback success-feedback' : 'add-value-feedback error-feedback';
-                feedback.style.display = 'block';
-            }
-            
-            function showConfirmPasswordFeedback(message, isSuccess) {
-                const feedback = document.getElementById('confirmPasswordFeedback');
-                feedback.textContent = message;
-                feedback.className = isSuccess ? 'confirm-password-feedback success-feedback' : 'confirm-password-feedback error-feedback';
-                feedback.style.display = 'block';
-            }
-            
-            function submitPassword() {
-                const password = document.getElementById('passwordInput').value;
+            function login() {
+                const username = document.getElementById('username').value;
+                const password = document.getElementById('password').value;
                 
-                if (!password) {
-                    showPasswordFeedback('Please enter password', false);
+                if (!username || !password) {
+                    showFeedback('Please enter username and password', false);
                     return;
                 }
                 
-                // Show loading state
                 const loginBtn = document.getElementById('loginButton');
                 const originalText = loginBtn.textContent;
                 loginBtn.textContent = 'Logging in...';
@@ -1447,67 +847,9 @@ def index():
                         'Content-Type': 'application/json',
                         'Accept': 'application/json'
                     },
-                    body: JSON.stringify({password: password})
-                })
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    if (data.success) {
-                        showPasswordFeedback('✅ ' + data.message, true);
-                        setTimeout(() => {
-                            hidePasswordModal();
-                            updateDisplay();
-                            // Redirect based on user type
-                            if (data.is_admin) {
-                                window.location.href = '/admin';
-                            } else {
-                                window.location.href = '/shopping';
-                            }
-                        }, 1000);
-                    } else {
-                        showPasswordFeedback('❌ ' + data.message, false);
-                        document.getElementById('passwordInput').value = '';
-                        document.getElementById('passwordInput').focus();
-                    }
-                })
-                .catch(error => {
-                    console.error('Login error:', error);
-                    showPasswordFeedback('❌ Network error. Please check connection and try again.', false);
-                })
-                .finally(() => {
-                    // Restore button state
-                    loginBtn.textContent = originalText;
-                    loginBtn.disabled = false;
-                });
-            }
-            
-            function submitConfirmPassword() {
-                const password = document.getElementById('confirmPasswordInput').value;
-                
-                if (!password) {
-                    showConfirmPasswordFeedback('Please enter password', false);
-                    return;
-                }
-                
-                // Show loading state
-                const confirmBtn = document.getElementById('confirmPasswordButton');
-                const originalText = confirmBtn.textContent;
-                confirmBtn.textContent = 'Processing...';
-                confirmBtn.disabled = true;
-                
-                fetch('/api/confirm_add_value', {
-                    method: 'POST',
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json'
-                    },
                     body: JSON.stringify({
-                        password: password,
-                        amount: selectedAmount
+                        username: username,
+                        password: password
                     })
                 })
                 .then(response => {
@@ -1518,194 +860,36 @@ def index():
                 })
                 .then(data => {
                     if (data.success) {
-                        showConfirmPasswordFeedback('✅ ' + data.message, true);
+                        showFeedback('✅ ' + data.message, true);
                         setTimeout(() => {
-                            hideConfirmPasswordModal();
-                            updateDisplay();
-                        }, 2000);
+                            if (data.is_admin) {
+                                window.location.href = '/admin';
+                            } else {
+                                window.location.href = '/shopping';
+                            }
+                        }, 1000);
                     } else {
-                        showConfirmPasswordFeedback('❌ ' + data.message, false);
-                        document.getElementById('confirmPasswordInput').value = '';
-                        document.getElementById('confirmPasswordInput').focus();
+                        showFeedback('❌ ' + data.message, false);
+                        document.getElementById('password').value = '';
+                        document.getElementById('password').focus();
                     }
                 })
                 .catch(error => {
-                    console.error('Confirm password error:', error);
-                    showConfirmPasswordFeedback('❌ Network error. Please check connection and try again.', false);
+                    console.error('Login error:', error);
+                    showFeedback('❌ Network error. Please try again.', false);
                 })
                 .finally(() => {
-                    // Restore button state
-                    confirmBtn.textContent = originalText;
-                    confirmBtn.disabled = false;
+                    loginBtn.textContent = originalText;
+                    loginBtn.disabled = false;
                 });
             }
             
-            function confirmAddValue() {
-                let amount = selectedAmount;
-                
-                // Check if custom amount is entered
-                const customAmount = document.getElementById('customAmount').value;
-                if (customAmount) {
-                    amount = parseFloat(customAmount);
-                }
-                
-                if (!amount || amount <= 0) {
-                    showAddValueFeedback('Please select or enter a valid amount', false);
-                    return;
-                }
-                
-                selectedAmount = amount;
-                hideAddValueModal();
-                showConfirmPasswordModal(amount);
-            }
-            
-            function checkBalance() {
-                fetch('/api/check_balance', { method: 'POST' })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            alert('✅ ' + data.message);
-                            updateDisplay();
-                        } else {
-                            alert('❌ ' + data.message);
-                        }
-                    });
-            }
-            
-            function refreshBalance() {
-                fetch('/api/refresh_balance', { method: 'POST' })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            updateDisplay();
-                        } else {
-                            alert('❌ ' + data.message);
-                        }
-                    });
-            }
-            
-            function logout() {
-                fetch('/api/logout', { method: 'POST' })
-                    .then(() => {
-                        updateDisplay();
-                    });
-            }
-            
-            function goToAdmin() {
-                window.location.href = '/admin';
-            }
-            
-            function goToRewards() {
-                window.location.href = '/rewards';
-            }
-            
-            function goToShoppingWithScanned() {
-                window.location.href = '/shopping';
-            }
-            
-            function clearScannedBarcodes() {
-                fetch('/api/clear_barcodes', { method: 'POST' })
-                    .then(() => {
-                        updateScannedProducts();
-                    });
-            }
-            
-            function removeScannedProduct(barcode) {
-                fetch('/api/remove_scanned_product', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ barcode: barcode })
-                })
-                .then(() => {
-                    updateScannedProducts();
-                });
-            }
-            
-            // Barcode scanner input handling
-            let barcodeBuffer = '';
-            let lastKeyTime = Date.now();
-            
-            document.addEventListener('keydown', function(event) {
-                const currentTime = Date.now();
-                
-                // Reset buffer if too much time has passed between keys
-                if (currentTime - lastKeyTime > 100) {
-                    barcodeBuffer = '';
-                }
-                
-                lastKeyTime = currentTime;
-                
-                // Only process digit keys and Enter
-                if (event.key >= '0' && event.key <= '9') {
-                    barcodeBuffer += event.key;
-                } else if (event.key === 'Enter') {
-                    if (barcodeBuffer.length >= 8) {  // Accept barcodes of length 8 or more
-                        processBarcode(barcodeBuffer);
-                    }
-                    barcodeBuffer = '';
-                    event.preventDefault(); // Prevent form submission
+            // Handle Enter key
+            document.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    login();
                 }
             });
-            
-            function processBarcode(barcode) {
-                fetch('/api/scan_barcode', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ barcode: barcode })
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        updateScannedProducts();
-                    } else {
-                        alert('❌ ' + data.message);
-                    }
-                });
-            }
-            
-            // Handle Enter key in password inputs
-            document.addEventListener('DOMContentLoaded', function() {
-                const passwordInput = document.getElementById('passwordInput');
-                if (passwordInput) {
-                    passwordInput.addEventListener('keypress', function(e) {
-                        if (e.key === 'Enter') {
-                            submitPassword();
-                        }
-                    });
-                }
-                
-                const confirmPasswordInput = document.getElementById('confirmPasswordInput');
-                if (confirmPasswordInput) {
-                    confirmPasswordInput.addEventListener('keypress', function(e) {
-                        if (e.key === 'Enter') {
-                            submitConfirmPassword();
-                        }
-                    });
-                }
-                
-                const customAmount = document.getElementById('customAmount');
-                if (customAmount) {
-                    customAmount.addEventListener('input', function() {
-                        if (this.value) {
-                            selectedAmount = parseFloat(this.value) || 0;
-                            // Clear button selections
-                            document.querySelectorAll('.amount-btn').forEach(btn => {
-                                btn.classList.remove('active');
-                            });
-                        }
-                    });
-                    
-                    customAmount.addEventListener('keypress', function(e) {
-                        if (e.key === 'Enter') {
-                            confirmAddValue();
-                        }
-                    });
-                }
-            });
-            
-            setInterval(updateDisplay, 1000);
-            setInterval(updateScannedProducts, 2000);
-            updateDisplay();
         </script>
     </body>
     </html>
@@ -1725,7 +909,7 @@ def shopping_page():
     # Get scanned products first
     scanned_products = get_scanned_products()
     
-    # Create JavaScript for initial cart - SIMPLIFIED
+    # Create JavaScript for initial cart
     cart_init = '{}'
     if scanned_products:
         cart_items = []
@@ -1735,7 +919,6 @@ def shopping_page():
     
     # If there are scanned products, only show those
     if scanned_products:
-        # Convert scanned products to HTML
         products_html = ""
         for product in scanned_products:
             products_html += f'''
@@ -1779,7 +962,6 @@ def shopping_page():
             </div>
             '''
     
-    # SIMPLIFIED HTML TEMPLATE - FIX THE JAVASCRIPT
     html_template = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -1975,16 +1157,14 @@ def shopping_page():
     </div>
 
     <script>
-        // Initialize cart - SIMPLE VERSION
+        // Initialize cart
         let cart = {cart_init};
         let userPoints = 0;
         
         console.log('Initial cart:', cart);
-        console.log('Cart init string:', '{cart_init}');
         
         // Event delegation for quantity buttons
         document.addEventListener('DOMContentLoaded', function() {{
-            // Handle increase button clicks
             document.addEventListener('click', function(event) {{
                 if (event.target.classList.contains('increase-btn')) {{
                     const controls = event.target.closest('.quantity-controls');
@@ -1999,7 +1179,6 @@ def shopping_page():
                 }}
             }});
             
-            // Initialize display
             updateAllQuantityDisplays();
             updateCartDisplay();
             loadUserPoints();
@@ -2036,10 +1215,8 @@ def shopping_page():
             
             const newQuantity = cart[productId] + change;
             
-            // Ensure quantity doesn't go below 0
             if (newQuantity < 0) return;
             
-            // Check stock if increasing
             if (change > 0) {{
                 const productCard = document.querySelector(`[data-id="${{productId}}"]`);
                 if (productCard) {{
@@ -2058,7 +1235,6 @@ def shopping_page():
             cart[productId] = newQuantity;
             console.log('Updated cart:', cart);
             
-            // Update the display
             updateQuantityDisplay(productId);
             updateCartDisplay();
         }}
@@ -2071,7 +1247,6 @@ def shopping_page():
         }}
         
         function updateAllQuantityDisplays() {{
-            // Update all quantity displays based on cart
             for (const productId in cart) {{
                 updateQuantityDisplay(productId);
             }}
@@ -2119,7 +1294,6 @@ def shopping_page():
                 cartItems.innerHTML = itemsHtml;
                 cartTotal.textContent = `Total: ¥${{total.toFixed(2)}}`;
                 
-                // Calculate points that will be earned (0.001 points per ¥1)
                 const pointsToEarn = total * 0.001;
                 pointsEarned.textContent = `You will earn: ${{pointsToEarn.toFixed(3)}} points`;
                 
@@ -2151,7 +1325,6 @@ def shopping_page():
             
             console.log('Checkout items:', items);
             
-            // Disable checkout button during processing
             const checkoutButton = document.getElementById('checkoutButton');
             checkoutButton.disabled = true;
             checkoutButton.textContent = 'Processing...';
@@ -2176,18 +1349,14 @@ def shopping_page():
                 if (data.success) {{
                     alert('✅ ' + data.message);
                     
-                    // Reset cart
                     cart = {{}};
                     
-                    // Update UI
                     updateAllQuantityDisplays();
                     updateCartDisplay();
                     loadUserPoints();
                     
-                    // Clear scanned barcodes
                     fetch('/api/clear_barcodes', {{ method: 'POST' }});
                     
-                    // Show success message and redirect
                     setTimeout(() => {{
                         window.location.href = '/';
                     }}, 2000);
@@ -2205,7 +1374,6 @@ def shopping_page():
             }});
         }}
         
-        // Auto-refresh points every 10 seconds
         setInterval(loadUserPoints, 10000);
     </script>
 </body>
@@ -2225,7 +1393,6 @@ def rewards_page():
         '''
     
     products = get_products()
-    # Filter products that can be purchased with points (reward_points_cost > 0)
     reward_products = [p for p in products if p[6] > 0]
     
     products_html = ""
@@ -3237,7 +2404,6 @@ def admin_page():
                     }});
             }}
             
-            // Handle new category selection
             document.getElementById('newProductCategory').addEventListener('change', function() {{
                 const newCategoryInput = document.getElementById('newCategoryInput');
                 if (this.value === 'new') {{
@@ -3280,13 +2446,11 @@ def admin_page():
                 .then(data => {{
                     if (data.success) {{
                         showFeedback('addProductFeedback', '✅ ' + data.message, true);
-                        // Clear form
                         document.getElementById('newProductName').value = '';
                         document.getElementById('newProductPrice').value = '';
                         document.getElementById('newProductBarcode').value = '';
                         document.getElementById('newProductStock').value = '100';
                         document.getElementById('newProductPoints').value = '0.0';
-                        // Reload page after 2 seconds
                         setTimeout(() => {{ window.location.reload(); }}, 2000);
                     }} else {{
                         showFeedback('addProductFeedback', '❌ ' + data.message, false);
@@ -3369,86 +2533,28 @@ def admin_page():
 # API ROUTES
 # ============================================================================
 
-@app.route('/api/status')
-def api_status():
-    """Get system status"""
-    return jsonify({
-        'serial_connected': serial_connected,
-        'current_card': current_card
-    })
-
-@app.route('/api/check_balance', methods=['POST'])
-def api_check_balance():
-    """Check and update balance from database"""
-    global current_card
-    
-    if not current_card:
-        return jsonify({'success': False, 'message': 'No card detected. Please swipe a card first.'})
-    
-    card_uid = current_card['card_uid']
-    customer_info = get_customer_info(card_uid)
-    
-    if not customer_info:
-        return jsonify({'success': False, 'message': 'Customer information not found'})
-    
-    name, balance, reward_points, _, _ = customer_info
-    
-    # Update current card balance
-    current_card['balance'] = balance
-    current_card['reward_points'] = reward_points
-    current_card['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Send updated balance to Arduino
-    send_balance_to_arduino(card_uid)
-    
-    return jsonify({
-        'success': True, 
-        'message': f'Balance updated: {name} - ¥{balance:.2f}, Points: {reward_points:.3f}',
-        'balance': balance,
-        'reward_points': reward_points
-    })
-
-@app.route('/api/refresh_balance', methods=['POST'])
-def api_refresh_balance():
-    """Refresh the current card balance display"""
-    if refresh_current_card_balance():
-        return jsonify({'success': True, 'message': 'Balance display refreshed'})
-    else:
-        return jsonify({'success': False, 'message': 'No card to refresh'})
-
 @app.route('/api/login', methods=['POST'])
 def api_login():
-    """Handle user login"""
+    """Handle user login with username and password"""
     try:
         data = request.get_json()
         if not data:
             return jsonify({'success': False, 'message': 'No data received'})
         
+        username = data.get('username', '').lower().strip()
         password = data.get('password', '')
         
-        if not current_card:
-            return jsonify({'success': False, 'message': 'No card detected'})
+        if not username or not password:
+            return jsonify({'success': False, 'message': 'Username and password required'})
         
-        if current_card.get('type') == 'unknown':
-            return jsonify({'success': False, 'message': 'Unauthorized card'})
-        
-        card_uid = current_card['card_uid']
-        
-        # Authenticate with password
-        success, message = authenticate_user(card_uid, password)
+        # Authenticate with username and password
+        success, message = authenticate_user(username, password)
         
         if success:
-            # Update current_card status
-            current_card['authenticated'] = True
-            current_card['needs_password'] = False
-            
-            # Send balance information to Arduino
-            send_balance_to_arduino(card_uid)
-            
             return jsonify({
-                'success': True, 
-                'message': f'Welcome {current_card["name"]}! Authentication successful.',
-                'user_name': current_card['name'],
+                'success': True,
+                'message': f'Welcome {session.get("user_name")}! Login successful.',
+                'user_name': session.get('user_name'),
                 'is_admin': session.get('is_admin', False)
             })
         else:
@@ -3460,68 +2566,8 @@ def api_login():
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
     """User logout"""
-    global current_card
-    
-    if current_card:
-        current_card['authenticated'] = False
-        current_card['needs_password'] = True
-    
     logout_user()
-    
     return jsonify({'success': True, 'message': 'Logged out successfully'})
-
-@app.route('/api/confirm_add_value', methods=['POST'])
-def api_confirm_add_value():
-    """Confirm add value with password verification and process immediately"""
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'success': False, 'message': 'No data received'})
-        
-        password = data.get('password', '')
-        amount = data.get('amount', 0)
-        
-        if not current_card:
-            return jsonify({'success': False, 'message': 'No card detected'})
-        
-        if not is_authenticated() and not (current_card and current_card.get('authenticated')):
-            return jsonify({'success': False, 'message': 'Please login first'})
-        
-        if amount <= 0:
-            return jsonify({'success': False, 'message': 'Invalid amount'})
-        
-        # Use the authenticated card UID
-        if is_authenticated():
-            card_uid = session.get('card_uid')
-        else:
-            card_uid = current_card['card_uid']
-        
-        # Verify password again for security
-        customer_info = get_customer_info(card_uid)
-        if not customer_info:
-            return jsonify({'success': False, 'message': 'Customer not found'})
-        
-        name, balance, reward_points, password_hash, _ = customer_info
-        
-        if not verify_password(password, password_hash):
-            return jsonify({'success': False, 'message': '❌ Invalid password. Please try again.'})
-        
-        # Process the add value immediately
-        success, message = add_value(card_uid, amount)
-        
-        if success:
-            return jsonify({
-                'success': True,
-                'message': message
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'message': message
-            })
-        
-    except Exception as e:
-        return jsonify({'success': False, 'message': '❌ Server error. Please try again.'})
 
 @app.route('/api/auth_status')
 def api_auth_status():
@@ -3530,8 +2576,22 @@ def api_auth_status():
     return jsonify({
         'authenticated': is_authenticated(),
         'current_user': auth_info,
-        'current_card': current_card
+        'current_user_data': current_user
     })
+
+@app.route('/api/user_points')
+def api_user_points():
+    """Get current user's reward points"""
+    if not is_authenticated():
+        return jsonify({'success': False, 'points': 0})
+    
+    username = session.get('username')
+    customer_info = get_customer_info(username)
+    
+    if customer_info:
+        return jsonify({'success': True, 'points': customer_info[2]})
+    else:
+        return jsonify({'success': False, 'points': 0})
 
 @app.route('/api/purchase', methods=['POST'])
 def api_purchase():
@@ -3557,10 +2617,10 @@ def api_purchase():
             print("❌ No items in cart")
             return jsonify({'success': False, 'message': 'No items in cart'})
         
-        card_uid = session.get('card_uid')
-        print(f"💳 Card UID: {card_uid}")
+        username = session.get('username')
+        print(f"👤 Username: {username}")
         
-        customer_info = get_customer_info(card_uid)
+        customer_info = get_customer_info(username)
         
         if not customer_info:
             print("❌ Customer not found")
@@ -3569,7 +2629,6 @@ def api_purchase():
         name, balance, reward_points, _, _ = customer_info
         print(f"👤 Customer: {name}, Balance: {balance}, Points: {reward_points}")
         
-        # Process each purchase
         total_price = 0
         total_earned_points = 0
         
@@ -3596,19 +2655,16 @@ def api_purchase():
             
             product_name, product_price, stock = product
             
-            # Check stock
             if stock < quantity:
                 print(f"❌ Insufficient stock: {product_name} (stock: {stock}, requested: {quantity})")
                 return jsonify({'success': False, 'message': f'Insufficient stock for {product_name}'})
             
-            # Check balance
             item_total = product_price * quantity
             if balance < item_total:
                 print(f"❌ Insufficient balance: needed {item_total}, have {balance}")
                 return jsonify({'success': False, 'message': f'Insufficient balance for {product_name}'})
             
-            # Record purchase
-            success, message = record_purchase(card_uid, product_id, quantity, use_points=False)
+            success, message = record_purchase(username, product_id, quantity, use_points=False)
             if not success:
                 print(f"❌ Purchase failed: {message}")
                 return jsonify({'success': False, 'message': message})
@@ -3618,15 +2674,12 @@ def api_purchase():
         
         print(f"✅ Purchase successful! Total: ¥{total_price:.2f}, Earned points: {total_earned_points:.3f}")
         
-        # Update current card balance from database
-        updated_info = get_customer_info(card_uid)
+        updated_info = get_customer_info(username)
         if updated_info:
             _, new_balance, new_points, _, _ = updated_info
-            if current_card:
-                current_card['balance'] = new_balance
-                current_card['reward_points'] = new_points
-            # Send updated balance to Arduino
-            send_balance_to_arduino(card_uid)
+            if current_user:
+                current_user['balance'] = new_balance
+                current_user['reward_points'] = new_points
         
         return jsonify({
             'success': True, 
@@ -3650,30 +2703,25 @@ def api_redeem_points():
     data = request.get_json()
     items = data.get('items', [])
     
-    card_uid = session.get('card_uid')
+    username = session.get('username')
     
-    # Process each redemption
     total_points_used = 0
     
     for item in items:
         product_id = item['productId']
         quantity = item['quantity']
-        success, message = record_purchase(card_uid, product_id, quantity, use_points=True)
+        success, message = record_purchase(username, product_id, quantity, use_points=True)
         if not success:
             return jsonify({'success': False, 'message': message})
         
-        # Calculate points used for this item
         products = get_products()
         product = next((p for p in products if p[0] == product_id), None)
         if product:
             total_points_used += product[6] * quantity
     
-    # Update current card points from database
-    updated_info = get_customer_info(card_uid)
-    if updated_info:
-        current_card['reward_points'] = updated_info[2]
-        # Send updated balance to Arduino
-        send_balance_to_arduino(card_uid)
+    updated_info = get_customer_info(username)
+    if updated_info and current_user:
+        current_user['reward_points'] = updated_info[2]
     
     return jsonify({
         'success': True, 
@@ -3681,28 +2729,14 @@ def api_redeem_points():
         'points_used': total_points_used
     })
 
-@app.route('/api/user_points')
-def api_user_points():
-    """Get current user's reward points"""
-    if not is_authenticated():
-        return jsonify({'success': False, 'points': 0})
-    
-    card_uid = session.get('card_uid')
-    customer_info = get_customer_info(card_uid)
-    
-    if customer_info:
-        return jsonify({'success': True, 'points': customer_info[2]})
-    else:
-        return jsonify({'success': False, 'points': 0})
-
 @app.route('/api/my_purchase_history')
 def api_my_purchase_history():
     """Get current user's purchase history only"""
     if not is_authenticated():
         return jsonify({'history': []})
     
-    card_uid = session.get('card_uid')
-    history_data = get_purchase_history(card_uid)
+    username = session.get('username')
+    history_data = get_purchase_history(username)
     history = []
     
     for item in history_data:
@@ -3727,8 +2761,8 @@ def api_my_topup_history():
     if not is_authenticated():
         return jsonify({'history': []})
     
-    card_uid = session.get('card_uid')
-    history_data = get_topup_history(card_uid)
+    username = session.get('username')
+    history_data = get_topup_history(username)
     history = []
     
     for item in history_data:
@@ -3750,8 +2784,8 @@ def api_my_reward_history():
     if not is_authenticated():
         return jsonify({'history': []})
     
-    card_uid = session.get('card_uid')
-    history_data = get_reward_redemptions(card_uid)
+    username = session.get('username')
+    history_data = get_reward_redemptions(username)
     history = []
     
     for item in history_data:
@@ -3780,7 +2814,6 @@ def api_scan_barcode():
         if not barcode:
             return jsonify({'success': False, 'message': 'No barcode provided'})
         
-        # Add barcode to scanned list
         success = add_scanned_barcode(barcode)
         
         if success:
@@ -3811,7 +2844,6 @@ def api_remove_scanned_product():
         barcode_to_remove = data.get('barcode', '')
         
         if barcode_to_remove:
-            # Remove all instances of this barcode
             global scanned_barcodes
             scanned_barcodes = deque([b for b in scanned_barcodes if b != barcode_to_remove], maxlen=10)
         
@@ -3880,45 +2912,37 @@ if __name__ == '__main__':
     print("=" * 60)
     print("🛒 Smart Shopping System with Barcode Scanner")
     print("=" * 60)
+    print("\n🌐 Access: http://localhost:5000")
+    print("\n📱 Features:")
+    print("   🏠 Login Page - Username/password authentication")
+    print("   🛒 Shopping - Auto-populates with scanned products")
+    print("   🎁 Rewards Shop - Exchange points for products")
+    print("   📊 My Purchase History - With barcode information")
+    print("   💰 My Top-up History - User's top-up records")
+    print("   🎁 My Reward History - Reward redemption records")
+    print("   👑 Admin Panel - Product management with barcode support")
+    print("\n🔐 Security Features:")
+    print("   ✅ Username/password authentication")
+    print("   ✅ Admin role detection and access control")
+    print("   ✅ Brute force protection (5 attempts limit)")
+    print("\n📦 Barcode Scanner Features:")
+    print("   ✅ Scan products on home page")
+    print("   ✅ Auto-add to shopping cart")
+    print("   ✅ EAN-13 barcode support")
+    print("   ✅ Real-time product lookup")
+    print("\n⭐ Reward System:")
+    print("   ✅ Earn 0.001 points for every ¥1 spent")
+    print("   ✅ Exchange points for special reward products")
+    print("   ✅ Separate rewards shop interface")
+    print("\n👤 Demo Accounts:")
+    print("   👑 admin / admin123 (Admin)")
+    print("   👑 william / 12345678 (Admin)")
+    print("   👤 user / demo123 (Regular User)")
+    print("\n📦 Test Barcodes (EAN-13):")
+    print("   4901777013931 - Coca-Cola")
+    print("   4902102118878 - Potato Chips")
+    print("   4901777242950 - Chocolate")
+    print("   4901777242967 - Mineral Water")
+    print("=" * 60)
     
-    if connect_serial():
-        threading.Thread(target=serial_listener, daemon=True).start()
-        print(f"\n🌐 Access: http://localhost:5000")
-        print("📱 Features:")
-        print("   🏠 Home - Card recognition + Barcode scanner")
-        print("   🛒 Shopping - Auto-populates with scanned products")
-        print("   🎁 Rewards Shop - Exchange points for products")
-        print("   📊 My Purchase History - With barcode information")
-        print("   💰 My Top-up History - User's top-up records")
-        print("   🎁 My Reward History - Reward redemption records")
-        print("   👑 Admin Panel - Product management with barcode support")
-        print("\n🔐 Security Features:")
-        print("   ✅ Password authentication required")
-        print("   ✅ Admin role detection and access control")
-        print("   ✅ Brute force protection (5 attempts limit)")
-        print("\n📦 Barcode Scanner Features:")
-        print("   ✅ Scan products on home page")
-        print("   ✅ Auto-add to shopping cart")
-        print("   ✅ EAN-13 barcode support")
-        print("   ✅ Real-time product lookup")
-        print("\n⭐ Reward System:")
-        print("   ✅ Earn 0.001 points for every ¥1 spent")
-        print("   ✅ Exchange points for special reward products")
-        print("   ✅ Separate rewards shop interface")
-        print("\n💳 Test Cards & Passwords:")
-        print("   👑 Admin - 9073ACED - Password: admin123")
-        print("   👑 William (Admin) - 300757DB - Password: 12345678")
-        print("\n📦 Test Barcodes (EAN-13):")
-        print("   4901777013931 - Coca-Cola")
-        print("   4902102118878 - Potato Chips")
-        print("   4901777242950 - Chocolate")
-        print("   4901777242967 - Mineral Water")
-        print("=" * 60)
-        
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-    else:
-        print("\n❌ Unable to connect to COM6")
-        print("💡 Please check:")
-        print("   1. Arduino is connected to COM6")
-        print("   2. Serial monitor is closed")
-        print("   3. Correct drivers are installed")
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
