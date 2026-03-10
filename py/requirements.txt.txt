@@ -1,0 +1,10 @@
+Flask==2.3.3
+flask-cors==4.0.0
+pyserial==3.5
+python-barcode==0.14.0
+Pillow==10.0.0
+opencv-python==4.8.1.78
+pyzbar==0.1.9
+numpy==1.24.3
+SQLAlchemy==2.0.19
+bcrypt==4.0.1

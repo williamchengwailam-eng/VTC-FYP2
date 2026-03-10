@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RFID卡片管理系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            width: 90%;
+            max-width: 500px;
+        }
+        
+        .header {
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            color: #333;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            color: #666;
+            font-size: 1.1em;
+        }
+        
+        .card-info {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 30px;
+            margin: 20px 0;
+            border: 2px dashed #dee2e6;
+            transition: all 0.3s ease;
+        }
+        
+        .card-info.active {
+            border-color: #28a745;
+            background: #f8fff9;
+        }
+        
+        .status {
+            font-size: 1.2em;
+            color: #6c757d;
+            margin-bottom: 20px;
+        }
+        
+        .user-info {
+            display: none;
+        }
+        
+        .user-info.active {
+            display: block;
+            animation: fadeIn 0.5s ease;
+        }
+        
+        .user-name {
+            font-size: 2em;
+            color: #333;
+            margin-bottom: 15px;
+            font-weight: bold;
+        }
+        
+        .balance {
+            font-size: 3em;
+            color: #28a745;
+            margin: 20px 0;
+            font-weight: bold;
+        }
+        
+        .card-uid {
+            color: #6c757d;
+            font-size: 0.9em;
+            margin-top: 15px;
+        }
+        
+        .time {
+            color: #999;
+            font-size: 0.8em;
+            margin-top: 10px;
+        }
+        
+        .instructions {
+            margin-top: 30px;
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📱 卡片管理系统</h1>
+            <p>请刷RFID卡查看信息</p>
+        </div>
+        
+        <div class="card-info" id="cardInfo">
+            <div class="status" id="status">等待刷卡...</div>
+            <div class="user-info" id="userInfo">
+                <div class="user-name" id="userName"></div>
+                <div>当前余额</div>
+                <div class="balance" id="balance"></div>
+                <div class="card-uid" id="cardUid"></div>
+                <div class="time" id="time"></div>
+            </div>
+        </div>
+        
+        <div class="instructions">
+            💡 将RFID卡片靠近读卡器即可显示信息
+        </div>
+    </div>
+
+    <script>
+        function updateCardInfo() {
+            fetch('/api/card_info')
+                .then(response => response.json())
+                .then(data => {
+                    const cardInfo = document.getElementById('cardInfo');
+                    const status = document.getElementById('status');
+                    const userInfo = document.getElementById('userInfo');
+                    const userName = document.getElementById('userName');
+                    const balance = document.getElementById('balance');
+                    const cardUid = document.getElementById('cardUid');
+                    const time = document.getElementById('time');
+                    
+                    if (data.success) {
+                        status.style.display = 'none';
+                        userInfo.classList.add('active');
+                        cardInfo.classList.add('active');
+                        cardInfo.classList.add('pulse');
+                        
+                        userName.textContent = data.data.holder;
+                        balance.textContent = '¥' + data.data.balance;
+                        cardUid.textContent = '卡片ID: ' + data.data.uid;
+                        time.textContent = '读取时间: ' + data.data.time;
+                        
+                        // 移除脉冲动画
+                        setTimeout(() => {
+                            cardInfo.classList.remove('pulse');
+                        }, 2000);
+                    } else {
+                        status.style.display = 'block';
+                        status.textContent = data.message;
+                        userInfo.classList.remove('active');
+                        cardInfo.classList.remove('active');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    document.getElementById('status').textContent = '系统错误，请刷新页面';
+                });
+        }
+        
+        // 每1秒更新一次信息
+        setInterval(updateCardInfo, 1000);
+        
+        // 页面加载时立即更新
+        updateCardInfo();
+    </script>
+</body>
+</html>
